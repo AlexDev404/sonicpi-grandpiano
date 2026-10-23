@@ -57,7 +57,7 @@ def main():
     with tempfile.NamedTemporaryFile(suffix=".osc", delete=False) as f:
         f.write(score)
         score_path = f.name
-    r = subprocess.run(["scsynth", "-N", score_path, "_", out, "44100", "WAV", "float",
+    r = subprocess.run(["scsynth", "-m", "131072", "-N", score_path, "_", out, "44100", "WAV", "float",
                         "-o", "2"], capture_output=True, text=True)
     os.unlink(score_path)
     errs = [l for l in (r.stdout + r.stderr).splitlines()

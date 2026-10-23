@@ -24,22 +24,36 @@ Grand Piano (a Yamaha C5) at 30 notes (A0 to C8, every 3 semitones) and three ve
 
 ## Use it in Sonic Pi
 
-```ruby
-# enable external synths first:  sonicpi config set enable-external-synths 1  (then reboot)
-load_synthdefs "C:/path/to/folder/containing/grandpiano.scsyndef"
+Two copies of the same synth are included. They differ only in the name stored inside:
 
-# external synths get no note-name or use_transpose handling, so convert notes yourself:
-define :pno do |n, **opts|
-  play note(n) + current_transpose, **opts
-end
+- **`grandpiano.scsyndef`** loads as an external synth:
+  ```ruby
+  # enable external synths first:  sonicpi config set enable-external-synths 1  (then reboot)
+  load_synthdefs "C:/path/to/folder/containing/grandpiano.scsyndef"
 
-use_synth "grandpiano"
-pno :c4, vel: 0.5
-```
+  # external synths get no note-name or use_transpose handling, so convert notes yourself:
+  define :pno do |n, **opts|
+    play note(n) + current_transpose, **opts
+  end
+
+  use_synth "grandpiano"
+  pno :c4, vel: 0.5
+  ```
+- **`sonic-pi-grandpiano.scsyndef`** is for registering it as a built-in `:grandpiano` (a
+  `SynthGrandPiano` entry in `synthinfo.rb` with `synth_name "grandpiano"`, plus this file in
+  `etc/synthdefs/compiled`). Sonic Pi then handles note names, `use_transpose` and chords
+  itself, so use plain `play`. Don't use the `pno` helper with it, or notes get transposed twice.
+
+**CPU:** each note's table lookups are computed once when the note starts, and the upper
+partials share one sine bank per group. 32 overlapping notes take about 35% of one core
+(measured offline). An earlier build re-read its tables on every audio block and needed
+about 176%, which caused "Timing error: can't keep up" in fast passages. Notes ring for
+`sustain` + `release` (7 s by default), so very dense passages stack many notes. A shorter
+`sustain` lightens the load further.
 
 | opt | default | what it does |
 |---|---|---|
-| `note` | 60 | MIDI number (see `pno` above for note names / transpose) |
+| `note` | 60 | MIDI number (note names work only with the built-in registration, or via `pno`) |
 | `vel` | 0.5 | strike strength, 0-1: loudness and brightness |
 | `sustain` | 6 | seconds the key is held |
 | `release` | 1 | damper fade after `sustain` |
@@ -61,8 +75,9 @@ python3 scripts/build_grandpiano.py data ./ref ./out
 ```
 
 The settings are env vars, documented at the top of `build_grandpiano.py`: `K`, `K_SIN`,
-`AMP_SMOOTH`, `ENV_SMOOTH`, `ENV_K_SMOOTH`, `KMODE`, `PHASES`, `ATT_MODE`, `ATT_BASS` and
-`CLICK_*`. The defaults reproduce the shipped synth.
+`AMP_SMOOTH`, `ENV_SMOOTH`, `ENV_K_SMOOTH`, `TABLE_RATE`, `KMODE`, `KL_SINGLE`, `PHASES`,
+`ATT_MODE`, `ATT_BASS`, `CLICK_*` and `SYNTH_NAME`. The defaults reproduce `grandpiano.scsyndef`;
+`SYNTH_NAME=sonic-pi-grandpiano` writes the built-in copy.
 
 ## Re-measure from the recordings (full pipeline)
 
@@ -125,7 +140,7 @@ Mean error at vel 0.375 (dB, lower is better):
 
 ## Files
 
-- `grandpiano.scsyndef`: the built synth
+- `grandpiano.scsyndef`, `sonic-pi-grandpiano.scsyndef`: the built synth (external / built-in name)
 - `scripts/analyze.py`: partial detection and inharmonicity fit
 - `scripts/analyze_env.py`: per-partial checkpoint envelopes
 - `scripts/build_grandpiano.py`: tables, velocity model, Klank fits and SynthDef generation

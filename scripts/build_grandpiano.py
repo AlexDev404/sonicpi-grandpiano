@@ -5,7 +5,22 @@ Usage: python3 -I build_grandpiano.py DATA_DIR REF_DIR_PREFIX OUT_DIR
            env_v2.json, env_v6.json, env_v12.json and (optionally) noise.json
   REF_DIR_PREFIX e.g. ./ref  (reads ref_v2/, ref/, ref_v12/ WAVs to measure hammer
            noise; only needed when DATA_DIR has no noise.json yet)
-  ENV_SMOOTH env var: smoothing width in semitones for the envelopes (default 2.0)
+  Env vars (defaults reproduce the shipped synth):
+    K=96          partials per note
+    K_SIN=24      partials 1..K_SIN get individual oscillators with full measured envelopes
+    AMP_SMOOTH=0  smoothing of partial levels across notes, semitones (0 = keep each note's spectrum)
+    ENV_SMOOTH=2.0  smoothing of envelopes across notes, semitones
+    ENV_K_SMOOTH=0  1 = also smooth envelopes across neighbouring partials
+    TABLE_RATE=ir table lookups computed once per note (scalar rate); 'kr' = every block (~4x the CPU)
+    KMODE=klang   partials above K_SIN: 'klang' = 4 groups of phase-scrambled sine banks (default),
+                  'klank' = impulse-excited resonator banks (can give a 'zap' at the attack)
+    KL_SINGLE=1   one Klang bank per group with a shared fast/slow mix (half the sines)
+    PHASES=rand   quasi-random partial phases (avoids a coherent per-cycle chirp); 'lin' = old
+    ATT_MODE=note string attack per note: ATT_BASS (0.016 s at A0) down to 2 ms at the top, ATT_CURVE=2
+    CLICK_F=2500, CLICK_GAIN=0.35   hammer click centre and level
+    HLPF=0        1 = felt-hammer low-pass opening over the attack (measured no benefit)
+    SYNTH_NAME    name inside the SynthDef (default grandpiano; sonic-pi-grandpiano for a synth
+                  registered in Sonic Pi's synthinfo.rb)
 """
 import json
 import math
@@ -32,6 +47,16 @@ class Klang(UGen):
     frequency_offset = param(0)
     specifications = param(unexpanded=True)
 
+
+def _make_select_ir():
+    @ugen(ar=True, kr=True, ir=True)
+    class Select(UGen):          # same scsynth UGen as supriya's Select, but scalar rate allowed
+        selector = param()
+        sources = param(unexpanded=True)
+    return Select
+
+
+SelectIR = _make_select_ir()
 
 GROUP_BOUNDS = [25, 33, 45, 61, 97]     # partial groups that share fast/slow decay times
 K = int(__import__('os').environ.get('K', '96'))   # partials per note
@@ -221,7 +246,12 @@ def build_tables(analysis_dir):
         w = np.exp(la6[:, ks]) + 1e-12
         gt1[:, g] = (w * kt1[:, ks]).sum(1) / w.sum(1)
         gt2[:, g] = (w * kt2[:, ks]).sum(1) / w.sum(1)
-    return dict(la6=la6, slo=slo, shi=shi, B=B, env=env, kff=kff, kt1=kt1, kt2=kt2, gt1=gt1, gt2=gt2)
+    gkf = np.zeros((len(NOTES), G))
+    for g in range(G):
+        ks = [k - 1 for k in range(GROUP_BOUNDS[g], GROUP_BOUNDS[g + 1]) if k <= kff.shape[1]]
+        w = np.exp(la6[:, ks]) + 1e-12
+        gkf[:, g] = (w * kff[:, ks]).sum(1) / w.sum(1)
+    return dict(la6=la6, slo=slo, shi=shi, B=B, env=env, kff=kff, kt1=kt1, kt2=kt2, gt1=gt1, gt2=gt2, gkf=gkf)
 
 
 def env_tables(analysis_dir):
@@ -296,7 +326,11 @@ def make_synthdef(T, NZ, gain_norm):
 
     def interp(table_col, i0, i1, fr):
         vals = [float(v) for v in table_col]
-        return Select.kr(selector=i0, sources=vals) * (1 - fr) + Select.kr(selector=i1, sources=vals) * fr
+        if __import__('os').environ.get('TABLE_RATE', 'ir') == 'ir':   # computed once when the note starts, not every block
+            sel = lambda i: SelectIR.ir(selector=i, sources=vals)
+        else:
+            sel = lambda i: Select.kr(selector=i, sources=vals)
+        return sel(i0) * (1 - fr) + sel(i1) * fr
 
     rates = ["ir"] * 9 + ["kr"] * 2
 
@@ -361,8 +395,22 @@ def make_synthdef(T, NZ, gain_norm):
             part = string * a * penv
             sig = part if sig is None else sig + part   # running sum keeps few buffers alive
 
+        single = __import__('os').environ.get('KL_SINGLE', '1') == '1'
         for g in range(G):
             if not kl_fast[g]:
+                continue
+            if single:   # one bank per group: partial levels exact, fast/slow mix shared per group
+                specs = []
+                for j in range(0, len(kl_fast[g]), 3):
+                    specs += [kl_fast[g][j], kl_fast[g][j + 1] + kl_slow[g][j + 1], kl_fast[g][j + 2]]
+                gk = interp(T["gkf"][:, g], i0, i1, fr)
+                e_f = EnvGen.kr(envelope=Envelope(amplitudes=[1, 1e-4], durations=[1], curves=["exponential"]),
+                                time_scale=interp(T["gt1"][:, g], i0, i1, fr).exponential() * math.log(1e4) * decay)
+                e_s = EnvGen.kr(envelope=Envelope(amplitudes=[1, 1e-4], durations=[1], curves=["exponential"]),
+                                time_scale=interp(T["gt2"][:, g], i0, i1, fr).exponential() * math.log(1e4) * decay)
+                bank = Klang._new_expanded(calculation_rate=CalculationRate.AUDIO, frequency_scale=1,
+                                           frequency_offset=0, specifications=specs)
+                sig = sig + bank * (e_f * gk + e_s * (1 - gk))
                 continue
             for specs, tab in ((kl_fast[g], "gt1"), (kl_slow[g], "gt2")):
                 tau = interp(T[tab][:, g], i0, i1, fr).exponential()
@@ -425,6 +473,14 @@ def make_synthdef(T, NZ, gain_norm):
     return grandpiano
 
 
+def rename_synthdef(data, new_name):
+    """Change the SynthDef name stored in a compiled single-def .scsyndef file."""
+    assert data[:4] == b"SCgf"
+    n = data[10]
+    nb = new_name.encode()
+    return data[:10] + bytes([len(nb)]) + nb + data[11 + n:]
+
+
 def main():
     analysis_dir, ref_prefix, out_dir = sys.argv[1:4]
     T = build_tables(analysis_dir)
@@ -455,10 +511,13 @@ def main():
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     data = sd.compile()
-    (out / "grandpiano.scsyndef").write_bytes(data)
+    synth_name = __import__('os').environ.get('SYNTH_NAME', 'grandpiano')
+    if synth_name != "grandpiano":
+        data = rename_synthdef(data, synth_name)
+    (out / f"{synth_name}.scsyndef").write_bytes(data)
     Path(out / "piano_tables.json").write_text(json.dumps(
         {k: np.asarray(v).tolist() for k, v in {**T, **NZ}.items() if k not in ("env",)} | {"gain_norm": gain_norm}))
-    print(f"wrote {out/'grandpiano.scsyndef'} ({len(data)} bytes), gain_norm={gain_norm:.4f}")
+    print(f"wrote {out / (synth_name + '.scsyndef')} ({len(data)} bytes), gain_norm={gain_norm:.4f}")
     for n in (36, 60, 84):
         i = NOTES.index(n)
         print(n, "k1 env dB:", np.round([T["env"][c][i, 0] for c in range(len(CHECK))]).astype(int).tolist())
