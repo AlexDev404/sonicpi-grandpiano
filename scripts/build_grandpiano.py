@@ -5,13 +5,7 @@ Usage: python3 -I build_grandpiano.py DATA_DIR REF_DIR_PREFIX OUT_DIR
            env_v2.json, env_v6.json, env_v12.json and (optionally) noise.json
   REF_DIR_PREFIX e.g. ./ref  (reads ref_v2/, ref/, ref_v12/ WAVs to measure hammer
            noise; only needed when DATA_DIR has no noise.json yet)
-  Env vars (defaults reproduce the shipped synth):
-    K=96          partials per note
-    K_SIN=24      partials 1..K_SIN get individual oscillators with full measured envelopes;
-                  the rest run in two Klank banks (fast + slow decay fitted to the measurements)
-    AMP_SMOOTH=0  smoothing of partial levels across notes, semitones (0 = keep each note's spectrum)
-    ENV_SMOOTH=2.0  smoothing of envelopes across notes, semitones
-    ENV_K_SMOOTH=0  1 = also smooth envelopes across neighbouring partials
+  ENV_SMOOTH env var: smoothing width in semitones for the envelopes (default 2.0)
 """
 import json
 import math
@@ -28,6 +22,18 @@ from supriya.ugens import (
     WhiteNoise, Mix, Klank, Impulse,
 )
 
+from supriya.ugens import UGen, param, ugen
+
+
+@ugen(ar=True)
+class Klang(UGen):
+    """SuperCollider core Klang: a bank of fixed sine oscillators (freq, amp, phase per partial)."""
+    frequency_scale = param(1)
+    frequency_offset = param(0)
+    specifications = param(unexpanded=True)
+
+
+GROUP_BOUNDS = [25, 33, 45, 61, 97]     # partial groups that share fast/slow decay times
 K = int(__import__('os').environ.get('K', '96'))   # partials per note
 K_PAIR = 16                              # partials that get a detuned second string
 K_SIN = int(__import__('os').environ.get('K_SIN', '24'))   # partials with full measured envelopes (SinOsc)
@@ -207,7 +213,15 @@ def build_tables(analysis_dir):
     shi = (la12 - la6) / (VEL["v12"] - VEL["v6"])
     env = env_tables(analysis_dir)
     kff, kt1, kt2 = fit_two_stage(env, CHECK)
-    return dict(la6=la6, slo=slo, shi=shi, B=B, env=env, kff=kff, kt1=kt1, kt2=kt2)
+    # per group: amplitude-weighted average (log) decay times
+    G = len(GROUP_BOUNDS) - 1
+    gt1 = np.zeros((len(NOTES), G)); gt2 = np.zeros((len(NOTES), G))
+    for g in range(G):
+        ks = [k - 1 for k in range(GROUP_BOUNDS[g], GROUP_BOUNDS[g + 1]) if k <= kt1.shape[1]]
+        w = np.exp(la6[:, ks]) + 1e-12
+        gt1[:, g] = (w * kt1[:, ks]).sum(1) / w.sum(1)
+        gt2[:, g] = (w * kt2[:, ks]).sum(1) / w.sum(1)
+    return dict(la6=la6, slo=slo, shi=shi, B=B, env=env, kff=kff, kt1=kt1, kt2=kt2, gt1=gt1, gt2=gt2)
 
 
 def env_tables(analysis_dir):
@@ -302,6 +316,9 @@ def make_synthdef(T, NZ, gain_norm):
 
         sig = None
         spec_fast, spec_slow = [], []
+        G = len(GROUP_BOUNDS) - 1
+        kl_fast = [[] for _ in range(G)]; kl_slow = [[] for _ in range(G)]
+        use_klang = __import__('os').environ.get('KMODE', 'klang') == 'klang'
         for k in range(1, K + 1):
             c = k - 1
             la = interp(T["la6"][:, c], i0, i1, fr)
@@ -313,8 +330,14 @@ def make_synthdef(T, NZ, gain_norm):
                 kf = interp(T["kff"][:, c], i0, i1, fr)
                 t60_1 = interp(T["kt1"][:, c], i0, i1, fr).exponential() * math.log(1000)
                 t60_2 = interp(T["kt2"][:, c], i0, i1, fr).exponential() * math.log(1000)
-                spec_fast += [fk, a * kf * KLANK_GAIN, t60_1]
-                spec_slow += [fk, a * (1 - kf) * KLANK_GAIN, t60_2]
+                if use_klang:
+                    g = max(i for i in range(G) if GROUP_BOUNDS[i] <= k)
+                    ph = ((k * k * 0.6180339887 + k * 0.381966) % 1.0) * 6.283
+                    kl_fast[g] += [fk, a * kf, ph]
+                    kl_slow[g] += [fk, a * (1 - kf), ph]
+                else:
+                    spec_fast += [fk, a * kf * KLANK_GAIN, t60_1]
+                    spec_slow += [fk, a * (1 - kf) * KLANK_GAIN, t60_2]
                 continue
             levels = [interp(T["env"][ci][:, c], i0, i1, fr).clip(-100, 0).db_to_amplitude().max(1e-5)
                       for ci in range(len(CHECK))]
@@ -325,7 +348,10 @@ def make_synthdef(T, NZ, gain_norm):
             # two slightly detuned strings -> gentle beating, mostly heard in the long tail
             cents = 0.25 + 0.9 * ((k * 0.618) % 1.0)
             det = 2 ** (cents / 1200)
-            phase = (k * 1.7) % 6.283
+            if __import__('os').environ.get('PHASES', 'rand') == 'rand':   # quasi-random phases: no coherent pulse/chirp
+                phase = ((k * k * 0.6180339887 + k * 0.381966) % 1.0) * 6.283
+            else:
+                phase = (k * 1.7) % 6.283
             s1 = SinOsc.ar(frequency=fk, phase=phase)
             if k <= K_PAIR:
                 s2 = SinOsc.ar(frequency=fk * det, phase=phase)
@@ -335,8 +361,23 @@ def make_synthdef(T, NZ, gain_norm):
             part = string * a * penv
             sig = part if sig is None else sig + part   # running sum keeps few buffers alive
 
+        for g in range(G):
+            if not kl_fast[g]:
+                continue
+            for specs, tab in ((kl_fast[g], "gt1"), (kl_slow[g], "gt2")):
+                tau = interp(T[tab][:, g], i0, i1, fr).exponential()
+                genv = EnvGen.kr(envelope=Envelope(amplitudes=[1, 1e-4], durations=[1], curves=["exponential"]),
+                                 time_scale=tau * math.log(1e4) * decay)
+                bank = Klang._new_expanded(calculation_rate=CalculationRate.AUDIO, frequency_scale=1,
+                                           frequency_offset=0, specifications=specs)
+                sig = sig + bank * genv
+
         if spec_fast:
-            exc = Impulse.ar(frequency=0)
+            if __import__('os').environ.get('KEXC', 'impulse') == 'noise':   # 2 ms noise burst: random phase per mode
+                burst = EnvGen.ar(envelope=Envelope(amplitudes=[0, 1, 0], durations=[0.001, 0.001], curves=['sine', 'sine']))
+                exc = WhiteNoise.ar() * burst * float(__import__('os').environ.get('KEXC_GAIN', '0.26'))
+            else:
+                exc = Impulse.ar(frequency=0)
             for spec in (spec_fast, spec_slow):
                 bank = Klank._new_expanded(calculation_rate=CalculationRate.AUDIO, source=exc,
                                            frequency_scale=1, frequency_offset=0, decay_scale=decay,
@@ -353,11 +394,26 @@ def make_synthdef(T, NZ, gain_norm):
         thud_env = EnvGen.ar(envelope=Envelope(amplitudes=[0, 1, 0], durations=[0.002, 0.045], curves=[1, -6]))
         click_env = EnvGen.ar(envelope=Envelope(amplitudes=[0, 1, 0], durations=[0.0005, 0.012], curves=[1, -6]))
         thud = LPF.ar(source=LPF.ar(source=PinkNoise.ar(), frequency=350), frequency=350) * thud_env * low_lvl * 4.0
-        click = BPF.ar(source=WhiteNoise.ar(), frequency=3500, reciprocal_of_q=1.2) * click_env * high_lvl * 2.0
+        click_f = float(__import__('os').environ.get('CLICK_F', '2500'))
+        click = BPF.ar(source=WhiteNoise.ar(), frequency=click_f, reciprocal_of_q=1.2) * click_env * high_lvl * 2.0 * float(__import__('os').environ.get('CLICK_GAIN', '0.35'))
+        if __import__('os').environ.get('ATT_MODE', 'note') == 'note':   # string build-up: ~12 ms in the bass to ~2 ms at the top
+            att_bass = float(__import__('os').environ.get('ATT_BASS', '0.016'))
+            s_att = (att_bass - (note - 21) * (att_bass - 0.002) / 63.0).clip(0.002, att_bass) * (1.15 - 0.3 * v)
+            s_curve = float(__import__('os').environ.get('ATT_CURVE', '2'))
+            s_env = EnvGen.ar(envelope=Envelope(amplitudes=[0, 1], durations=[1], curves=[s_curve]), time_scale=s_att)
+            sig = sig * s_env
         sig = sig + thud + click
+        if __import__('os').environ.get('HLPF', '0') == '1':   # felt hammer: the top end opens up over the first few ms (slower in the bass)
+            sweep_t = (0.012 - (note - 36) * 0.0003).clip(0.002, 0.02)
+            cut0 = (freq * 3).max(300)
+            open_env = EnvGen.ar(envelope=Envelope(amplitudes=[0, 1], durations=[1], curves=[-3]), time_scale=sweep_t)
+            cutoff = (cut0.log() + open_env * ((19000 / cut0).log())).exponential()
+            sig = LPF.ar(source=sig, frequency=cutoff)
 
         # hammer contact softens the very start; harder / higher = quicker
         att = (0.004 - 0.0025 * v - (note - 60) * 0.00003).clip(0.0008, 0.006)
+        if __import__('os').environ.get('ATT_MODE', 'note') == 'note':
+            att = 0.0005   # strings have their own attack above; this only de-clicks
         key = EnvGen.ar(
             envelope=Envelope(amplitudes=[0, 1, 1, 0], durations=[att, sustain, release], curves=[2, 0, -4]),
             done_action=2)

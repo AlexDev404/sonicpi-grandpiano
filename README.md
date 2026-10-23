@@ -9,13 +9,18 @@ Grand Piano (a Yamaha C5) at 30 notes (A0 to C8, every 3 semitones) and three ve
 
 - **Partials 1-24** each get their own oscillator and follow their measured level curve
   (9 checkpoints, 0-16 s). The first 16 also get a slightly detuned second string.
-- **Partials 25-96** live in two `Klank` resonator banks, one fast-decaying and one
-  slow-decaying, with the mix and decay times fitted to each partial's measured curve.
-  This is what gives bass notes their bright "zing" (real A0 has energy up to its 80th
-  partial). Each `Klank` is a single UGen, so this costs little CPU and stays well within
-  scsynth's limit on how many audio signals can be in flight at once.
+- **Partials 25-96** run in 4 groups of `Klang` sine banks (one UGen per group and decay
+  stage). Each partial keeps its measured level and its own fast/slow mix; each group shares
+  fast and slow decay times. This is what gives bass notes their bright "zing" (real A0 has
+  energy up to its 80th partial), at little CPU cost and well within scsynth's limit on how
+  many audio signals can be in flight at once.
+- **Quasi-random partial phases.** If all partials start in phase, the stretched (inharmonic)
+  partials of the bass re-form a pulse every cycle that smears into a falling chirp, heard as a
+  "zap" at the attack. (An earlier version had this.)
+- **The strings build up over about 16 ms at A0, down to 2 ms at the top,** as measured from the
+  recordings. The hammer thump and click start instantly on top.
 - Each sampled note keeps its own spectrum. Notes in between interpolate between the two
-  nearest sampled notes. A short hammer thump and click is added on top.
+  nearest sampled notes.
 
 ## Use it in Sonic Pi
 
@@ -56,7 +61,8 @@ python3 scripts/build_grandpiano.py data ./ref ./out
 ```
 
 The settings are env vars, documented at the top of `build_grandpiano.py`: `K`, `K_SIN`,
-`AMP_SMOOTH`, `ENV_SMOOTH` and `ENV_K_SMOOTH`. The defaults reproduce the shipped synth.
+`AMP_SMOOTH`, `ENV_SMOOTH`, `ENV_K_SMOOTH`, `KMODE`, `PHASES`, `ATT_MODE`, `ATT_BASS` and
+`CLICK_*`. The defaults reproduce the shipped synth.
 
 ## Re-measure from the recordings (full pipeline)
 
@@ -96,19 +102,26 @@ python3 scripts/render.py out/grandpiano.scsyndef grandpiano renders/g_C4.wav 4.
 # Ignores the recording's noise floor and the 50 Hz mains hum below the note.
 python3 scripts/bands.py renders g C4 [-v]          # REF_DIR=... to compare other layers
 
+# the first 64 ms: third-octave bands in 4 ms frames vs the real attack, plus how much the
+# synth flickers frame to frame compared with the real piano (a "zap" shows up as extra flicker)
+python3 scripts/onset_score.py renders g A1 C2 A2 C3
+
 # level and brightness table for one note
 python3 scripts/compare.py ref/C4.wav renders/g_C4.wav
 ```
 
 `vel=0.375` corresponds to Salamander layer 6. The layers map as layer / 16 (2 → 0.125, 12 → 0.75).
 
-Mean band error at vel 0.375 (dB, lower is better):
+Mean error at vel 0.375 (dB, lower is better):
 
-| | first version | this version |
-|---|---|---|
-| bass (A0-A2) | 4.9 | 2.2 |
-| middle (C3-C5) | 3.3 | 2.3 |
-| treble (C6, C7) | 3.8 | 3.3 |
+| | first version | 96-partial version | this version |
+|---|---|---|---|
+| bass tone (A0-A2) | 4.9 | 2.1 | 2.1 |
+| middle tone (C3-C5) | 3.3 | 2.3 | 2.3 |
+| treble tone (C6, C7) | 3.8 | 3.3 | 3.3 |
+| attack, bass (first 64 ms) | 9.9 | 6.5 | 4.8 |
+| attack, middle | 4.6 | 3.3 | 2.7 |
+| attack flicker vs real piano | +0.8 | +1.3 | -1.1 |
 
 ## Files
 
@@ -117,8 +130,8 @@ Mean band error at vel 0.375 (dB, lower is better):
 - `scripts/analyze_env.py`: per-partial checkpoint envelopes
 - `scripts/build_grandpiano.py`: tables, velocity model, Klank fits and SynthDef generation
 - `scripts/render.py`: non-realtime scsynth renderer (writes the OSC score itself)
-- `scripts/bands.py`, `scripts/compare.py`: real vs synth measurements
-- `scripts/klank_cal.py`: measures Klank's output gain (0.514 x amplitude), used by the builder
+- `scripts/bands.py`, `scripts/onset_score.py`, `scripts/onset.py`, `scripts/compare.py`: real vs synth measurements
+- `scripts/klank_cal.py`: measures Klank's output gain (0.514 x amplitude), used by `KMODE=klank`
 - `scripts/build_otey_test.py`: OteyPiano test SynthDef (sc3-plugins scsynth only; not SuperSonic)
 - `data/`: measurements derived from the Salamander Grand Piano
 
