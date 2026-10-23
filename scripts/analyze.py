@@ -13,7 +13,7 @@ from scipy.signal import fftconvolve
 
 NAMES = {"C": 0, "C#": 1, "D": 2, "D#": 3, "E": 4, "F": 5, "F#": 6, "G": 7,
          "G#": 8, "A": 9, "A#": 10, "B": 11}
-MAX_PARTIALS = 24
+MAX_PARTIALS = int(__import__('os').environ.get('MAX_PARTIALS', '96'))
 ENV_RATE = 200          # envelope samples per second
 
 

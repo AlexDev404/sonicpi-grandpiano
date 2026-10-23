@@ -5,7 +5,13 @@ Usage: python3 -I build_grandpiano.py DATA_DIR REF_DIR_PREFIX OUT_DIR
            env_v2.json, env_v6.json, env_v12.json and (optionally) noise.json
   REF_DIR_PREFIX e.g. ./ref  (reads ref_v2/, ref/, ref_v12/ WAVs to measure hammer
            noise; only needed when DATA_DIR has no noise.json yet)
-  ENV_SMOOTH env var: smoothing width in semitones for the envelopes (default 2.0)
+  Env vars (defaults reproduce the shipped synth):
+    K=96          partials per note
+    K_SIN=24      partials 1..K_SIN get individual oscillators with full measured envelopes;
+                  the rest run in two Klank banks (fast + slow decay fitted to the measurements)
+    AMP_SMOOTH=0  smoothing of partial levels across notes, semitones (0 = keep each note's spectrum)
+    ENV_SMOOTH=2.0  smoothing of envelopes across notes, semitones
+    ENV_K_SMOOTH=0  1 = also smooth envelopes across neighbouring partials
 """
 import json
 import math
@@ -16,12 +22,16 @@ import numpy as np
 from scipy.io import wavfile
 
 from supriya import Envelope, synthdef
+from supriya.enums import CalculationRate
 from supriya.ugens import (
     BPF, DetectSilence, EnvGen, LPF, HPF, Out, Pan2, PinkNoise, Select, SinOsc,
-    WhiteNoise, Mix,
+    WhiteNoise, Mix, Klank, Impulse,
 )
 
-K = 16                                   # partials per note
+K = int(__import__('os').environ.get('K', '96'))   # partials per note
+K_PAIR = 16                              # partials that get a detuned second string
+K_SIN = int(__import__('os').environ.get('K_SIN', '24'))   # partials with full measured envelopes (SinOsc)
+KLANK_GAIN = 1 / 0.514                   # Klank rings at 0.514 x its amplitude (measured)
 NOTES = list(range(21, 109, 3))          # A0 .. C8, 30 table points
 VEL = {"v2": 2 / 16, "v6": 6 / 16, "v12": 12 / 16}
 FLOOR_DB = -90.0
@@ -65,10 +75,16 @@ def raw_tables(layer):
                 ff[i, k - 1] = min(max(frac, 0.02), 0.98)
                 ltf[i, k - 1] = math.log(tf)
                 lts[i, k - 1] = math.log(ts)
-        # partials that should exist (below 16 kHz) but were not detected -> very quiet
+        # partials below 16 kHz that were not detected: just under the weakest detected
+        # one (they were below the detection threshold), not silent
+        found = la[i][~np.isnan(la[i])]
+        miss_level = (found.min() - math.log(2.0)) if len(found) else math.log(10 ** (FLOOR_DB / 20))
+        top_k = max([p["k"] for p in d["partials"]] + [1])
         for k in range(1, K + 1):
             if np.isnan(la[i, k - 1]) and k * f0 < 16000:
-                la[i, k - 1] = math.log(10 ** (FLOOR_DB / 20))
+                # beyond the highest partial ever detected, fall off quickly instead
+                extra = max(0, k - top_k) * math.log(10 ** (3 / 20))
+                la[i, k - 1] = miss_level - extra
     return la, ff, ltf, lts, B
 
 
@@ -92,7 +108,10 @@ def smooth_rows(tab, robust=True, width=None):
                 w = w * (dev < 2.5 * mad)
                 if w.sum() == 0:
                     w = np.exp(-0.5 * ((x[ok] - n) / SMOOTH_ST) ** 2)
-            out[i, k] = np.average(yy, weights=w)
+            if w.sum() <= 1e-12:      # no measurement anywhere near: use the nearest one
+                out[i, k] = yy[np.argmin(np.abs(x[ok] - n))]
+            else:
+                out[i, k] = np.average(yy, weights=w)
     return out
 
 
@@ -103,6 +122,51 @@ def fill_missing_k(tab, default):
             if np.isnan(tab[i, k]):
                 tab[i, k] = tab[i, k - 1] if k > 0 else default
     return tab
+
+
+def smooth_k(tab):
+    out = tab.copy()
+    for k in range(K_PAIR, tab.shape[1] - 1):
+        out[:, k] = 0.25 * tab[:, k - 1] + 0.5 * tab[:, k] + 0.25 * tab[:, k + 1]
+    return out
+
+
+def fill_nan_notes(tab):
+    """Fill missing table entries by interpolating across notes, without smoothing."""
+    out = tab.copy()
+    x = np.array(NOTES, float)
+    for k in range(tab.shape[1]):
+        y = tab[:, k]
+        ok = ~np.isnan(y)
+        if ok.sum() == 0:
+            out[:, k] = math.log(10 ** (FLOOR_DB / 20))
+        elif ok.sum() < len(y):
+            out[:, k] = np.interp(x, x[ok], y[ok])
+    return out
+
+
+def fit_two_stage(env_tabs, check):
+    """For every (note, k): fraction f of a fast decay tau1 plus (1-f) of a slow decay tau2
+    that best matches the measured checkpoint levels (dB)."""
+    t = np.array(check)
+    fs = np.linspace(0.0, 0.97, 14)
+    t1s = np.geomspace(0.03, 2.0, 16)
+    t2s = np.geomspace(0.3, 40.0, 18)
+    F, T1, T2 = np.meshgrid(fs, t1s, t2s, indexing="ij")
+    F, T1, T2 = F.ravel(), T1.ravel(), T2.ravel()
+    M = F[:, None] * np.exp(-t[None, :] / T1[:, None]) + (1 - F[:, None]) * np.exp(-t[None, :] / T2[:, None])
+    MdB = 20 * np.log10(np.maximum(M, 1e-6))
+    L = np.stack(env_tabs, axis=-1)            # [note, k, check]
+    n_notes, n_k, _ = L.shape
+    ff = np.zeros((n_notes, n_k)); tau1 = np.ones((n_notes, n_k)); tau2 = np.ones((n_notes, n_k))
+    for i in range(n_notes):
+        for k in range(n_k):
+            y = L[i, k]
+            w = (y > -80).astype(float)
+            err = (((MdB - y[None, :]) ** 2) * w[None, :]).sum(axis=1)
+            j = int(np.argmin(err))
+            ff[i, k], tau1[i, k], tau2[i, k] = F[j], T1[j], T2[j]
+    return ff, np.log(tau1), np.log(tau2)
 
 
 def smooth_vec(v):
@@ -116,7 +180,11 @@ def build_tables(analysis_dir):
         "v12": load_layer(Path(analysis_dir) / "analysis_v12.json"),
     }
     raw = {k: raw_tables(v) for k, v in layers.items()}
-    la = {k: smooth_rows(raw[k][0]) for k in raw}
+    AMP_SMOOTH = float(__import__('os').environ.get('AMP_SMOOTH', '0'))
+    if AMP_SMOOTH > 0:
+        la = {k: smooth_rows(raw[k][0], robust=False, width=AMP_SMOOTH) for k in raw}
+    else:   # keep each sampled note's own spectrum; only fill gaps
+        la = {k: fill_nan_notes(raw[k][0]) for k in raw}
     # decay shapes: pool all three layers for stability (decay is mostly velocity-independent)
     ff = smooth_rows(np.nanmean(np.stack([raw[k][1] for k in raw]), axis=0))
     ltf = smooth_rows(np.nanmean(np.stack([raw[k][2] for k in raw]), axis=0))
@@ -138,7 +206,8 @@ def build_tables(analysis_dir):
     slo = (la6 - la2) / (VEL["v6"] - VEL["v2"])
     shi = (la12 - la6) / (VEL["v12"] - VEL["v6"])
     env = env_tables(analysis_dir)
-    return dict(la6=la6, slo=slo, shi=shi, B=B, env=env)
+    kff, kt1, kt2 = fit_two_stage(env, CHECK)
+    return dict(la6=la6, slo=slo, shi=shi, B=B, env=env, kff=kff, kt1=kt1, kt2=kt2)
 
 
 def env_tables(analysis_dir):
@@ -160,6 +229,8 @@ def env_tables(analysis_dir):
     for c in range(arr.shape[0]):
         t = smooth_rows(arr[c], width=ENV_SMOOTH)
         t = fill_missing_k(t, -60.0)
+        if __import__('os').environ.get('ENV_K_SMOOTH', '0') == '1':
+            t = smooth_k(t)
         out.append(np.clip(t, -100.0, 0.0))
     # keep each partial's envelope non-increasing after the first checkpoint
     for c in range(2, len(out)):
@@ -229,7 +300,8 @@ def make_synthdef(T, NZ, gain_norm):
         dv = v - VEL["v6"]
         tilt = (hard - 0.5) * 1.5
 
-        partials = []
+        sig = None
+        spec_fast, spec_slow = [], []
         for k in range(1, K + 1):
             c = k - 1
             la = interp(T["la6"][:, c], i0, i1, fr)
@@ -237,10 +309,17 @@ def make_synthdef(T, NZ, gain_norm):
             a = (la + slope * dv + tilt * math.log(k)).clip(-25, 3).exponential()
             fk = freq * k * (1 + Bc * k * k).sqrt()
             a = a * (fk < 19000)
+            if k > K_SIN:
+                kf = interp(T["kff"][:, c], i0, i1, fr)
+                t60_1 = interp(T["kt1"][:, c], i0, i1, fr).exponential() * math.log(1000)
+                t60_2 = interp(T["kt2"][:, c], i0, i1, fr).exponential() * math.log(1000)
+                spec_fast += [fk, a * kf * KLANK_GAIN, t60_1]
+                spec_slow += [fk, a * (1 - kf) * KLANK_GAIN, t60_2]
+                continue
             levels = [interp(T["env"][ci][:, c], i0, i1, fr).clip(-100, 0).db_to_amplitude().max(1e-5)
                       for ci in range(len(CHECK))]
             durs = [CHECK[j + 1] - CHECK[j] for j in range(len(CHECK) - 1)]
-            penv = EnvGen.ar(envelope=Envelope(amplitudes=levels, durations=durs,
+            penv = EnvGen.kr(envelope=Envelope(amplitudes=levels, durations=durs,
                                                curves=["exponential"] * len(durs)),
                              time_scale=decay)
             # two slightly detuned strings -> gentle beating, mostly heard in the long tail
@@ -248,10 +327,21 @@ def make_synthdef(T, NZ, gain_norm):
             det = 2 ** (cents / 1200)
             phase = (k * 1.7) % 6.283
             s1 = SinOsc.ar(frequency=fk, phase=phase)
-            s2 = SinOsc.ar(frequency=fk * det, phase=phase)
-            string = s1 * 0.85 + s2 * 0.15
-            partials.append(string * a * penv)
-        sig = Mix.new(partials)
+            if k <= K_PAIR:
+                s2 = SinOsc.ar(frequency=fk * det, phase=phase)
+                string = s1 * 0.85 + s2 * 0.15
+            else:
+                string = s1
+            part = string * a * penv
+            sig = part if sig is None else sig + part   # running sum keeps few buffers alive
+
+        if spec_fast:
+            exc = Impulse.ar(frequency=0)
+            for spec in (spec_fast, spec_slow):
+                bank = Klank._new_expanded(calculation_rate=CalculationRate.AUDIO, source=exc,
+                                           frequency_scale=1, frequency_offset=0, decay_scale=decay,
+                                           specifications=spec)
+                sig = sig + bank
 
         # hammer noise: low "thump" and a short high "click", levels measured per note
         nl6 = interp(NZ["low6"], i0, i1, fr)
@@ -311,7 +401,7 @@ def main():
     data = sd.compile()
     (out / "grandpiano.scsyndef").write_bytes(data)
     Path(out / "piano_tables.json").write_text(json.dumps(
-        {k: np.asarray(v).tolist() for k, v in {**T, **NZ}.items() if k != "env"} | {"gain_norm": gain_norm}))
+        {k: np.asarray(v).tolist() for k, v in {**T, **NZ}.items() if k not in ("env",)} | {"gain_norm": gain_norm}))
     print(f"wrote {out/'grandpiano.scsyndef'} ({len(data)} bytes), gain_norm={gain_norm:.4f}")
     for n in (36, 60, 84):
         i = NOTES.index(n)
